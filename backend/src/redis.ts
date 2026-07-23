@@ -1,13 +1,15 @@
-import {createClient} from "redis";
+import { createClient } from "redis";
+import dotenv from "dotenv";
 
-const publisher=createClient();
-const subscriber=createClient();
+dotenv.config();
 
-(async ()=>{
+const publisher = createClient({ url: process.env.REDIS_URL! });
+const subscriber = publisher.duplicate();
+
+(async () => {
     await publisher.connect();
     await subscriber.connect();
-
-    console.log("Redis Connected!")
+    console.log("Redis Connected");
 })();
 
-export {publisher,subscriber};
+export { publisher, subscriber };
