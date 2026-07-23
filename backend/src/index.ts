@@ -1,5 +1,5 @@
 import express from "express";
-import cors from "cors"; 
+import cors from "cors";
 import authRoutes from "./routes/authRoutes.js";
 import dns from 'dns';
 import { WebSocketServer, WebSocket } from "ws";
@@ -41,9 +41,13 @@ interface Question {
     answer: number;
 }
 
-const questions: Question[]=[];
+// FIX: questions used to be one shared array for every room, so two rooms
+// could collide on a question with the same text. Now scoped per room.
+const roomQuestions: Map<string, Question[]> = new Map();
 const sockets: SocketsMap = {};
 const clients = new Set<CustomWebSocket>();
+
+const MAX_SCORE_PER_ANSWER = 100; // basic clamp so a client can't send arbitrary scores
 
 async function sendRooms() {
     const roomIDs = await publisher.sMembers("roomIDs");
@@ -60,8 +64,11 @@ async function sendPlayers(roomID: string) {
     const players = await publisher.sMembers(roomID);
     const host = await publisher.get(`host:${roomID}`);
 
+    // FIX: roomID was missing from this payload, so a client joined to multiple
+    // rooms had no way to tell which room a player-update belonged to.
     const payload = JSON.stringify({
         event: "player-update",
+        roomID,
         host,
         players
     });
@@ -78,10 +85,10 @@ async function gameStart(roomID: string) {
     const users = await publisher.sMembers(roomID);
     if (users.length === 0) return;
 
-    const ques=await publisher.sMembers(`${roomID}:question`);
-    const quest = ques.map(q => questions.find(que => que.text === q));
+    // FIX: pull from this room's own question list instead of a global array
+    const quest = roomQuestions.get(roomID) ?? [];
 
-    const payload = JSON.stringify({ event: "game-started", roomID,questions:quest });
+    const payload = JSON.stringify({ event: "game-started", roomID, questions: quest });
 
     users.forEach((user) => {
         const client = sockets[user];
@@ -112,25 +119,29 @@ async function deleted(roomID: string) {
             }
         }
     });
+
+    roomQuestions.delete(roomID);
 }
 
-async function displayScores(roomID:string)
-{
-    const scores=await publisher.zRange(`room:${roomID}:scores`,0,-1,{REV:true});
-    const users=await publisher.sMembers(roomID);
+async function displayScores(roomID: string) {
+    // FIX: zRange with REV only returns member names, not their scores.
+    // zRangeWithScores is needed to actually send point totals to the client.
+    const scores = await publisher.zRangeWithScores(`room:${roomID}:scores`, 0, -1, { REV: true });
+    const users = await publisher.sMembers(roomID);
     if (users.length === 0) return;
 
-    users.forEach((user)=>{
-        const client=sockets[user];
-        if(client)
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                    event: "leaderboard",
-                    scores,
-                    roomID
-                }));
-            }
-    })
+    const payload = JSON.stringify({
+        event: "leaderboard",
+        scores: scores.map((s) => ({ username: s.value, score: s.score })),
+        roomID
+    });
+
+    users.forEach((user) => {
+        const client = sockets[user];
+        if (client && client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+        }
+    });
 }
 
 // Subscriber event router
@@ -180,6 +191,7 @@ wss.on("connection", async (socket: CustomWebSocket) => {
 
                 socket.activeRoomID = roomID;
                 socket.joinedRooms.add(roomID);
+                roomQuestions.set(roomID, []);
 
                 socket.send(JSON.stringify({ roomID, event: "room-created" }));
 
@@ -236,31 +248,34 @@ wss.on("connection", async (socket: CustomWebSocket) => {
                 await publisher.publish("room-events", JSON.stringify({ event: "player-update", roomID: data.roomID }));
             }
 
-            else if(data.event==="add-question")
-            {
+            else if (data.event === "add-question") {
                 const host = await publisher.get(`host:${data.roomID}`);
                 if (host !== data.username) {
                     return socket.send(JSON.stringify({ event: "error", message: "Only host can add questions" }));
                 }
-                questions.push(data.question);
-                let flag=0;
-                const qs=await publisher.sMembers(`${data.roomID}:question`);
-                qs.forEach((q)=>{
-                    if(q===data.question.text)
-                    {
-                        flag=1;
-                        socket.send(JSON.stringify({ event: "error", message: "Question already exist" }));
-                    }
-                })
-                if(flag===0)
-                    await publisher.sAdd(`${data.roomID}:question`,data.question.text);
+
+                const qs = await publisher.sMembers(`${data.roomID}:question`);
+                if (qs.includes(data.question.text)) {
+                    return socket.send(JSON.stringify({ event: "error", message: "Question already exists" }));
+                }
+
+                const list = roomQuestions.get(data.roomID) ?? [];
+                list.push(data.question);
+                roomQuestions.set(data.roomID, list);
+
+                await publisher.sAdd(`${data.roomID}:question`, data.question.text);
+
+                socket.send(JSON.stringify({ event: "question-added", question: data.question }));
             }
-            else if(data.event==="game-over")
-            {
-                await publisher.zIncrBy(`room:${data.roomID}:scores`, data.score, data.username);
-                publisher.publish("room-events",JSON.stringify({
-                    event:"display-scores",
-                    roomID:data.roomID
+
+            else if (data.event === "game-over") {
+                // FIX: clamp incoming score so a modified client can't inflate it arbitrarily
+                const safeScore = Math.max(0, Math.min(Number(data.score) || 0, MAX_SCORE_PER_ANSWER));
+
+                await publisher.zIncrBy(`room:${data.roomID}:scores`, safeScore, data.username);
+                publisher.publish("room-events", JSON.stringify({
+                    event: "display-scores",
+                    roomID: data.roomID
                 }));
             }
         } catch (err) {
@@ -302,4 +317,3 @@ wss.on("connection", async (socket: CustomWebSocket) => {
         await publisher.publish("room-events", JSON.stringify({ event: "all-rooms" }));
     });
 });
-
